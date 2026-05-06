@@ -317,14 +317,14 @@ def collect_post_urns(client: LinkedInClient, org_id: str, out_dir: Path,
     else:
         print(f"\n[posts:list] listing post URNs (postsByAuthor) — years {sorted(years)}")
     page_urn = f"urn:li:organizationalPage:{org_id}"
-    params = {"q": "postsByAuthor", "author": page_urn}
+    params = {"q": "postsByAuthor", "author": page_urn, "maxPaginationCount": 100}
     pages = []
     urns: list[str] = []
     urn_meta: list[dict] = []  # parallel: {urn, year?, ts_ms?}
     seen: set[str] = set()
     earliest_wanted = min(years) if years else None
     short_circuit = False
-    for i, page in enumerate(paginate_start(client, "/rest/dmaFeedContentsExternal", params, page_size=50, sleep_between=1)):
+    for i, page in enumerate(paginate_cursor(client, "/rest/dmaFeedContentsExternal", params, sleep_between=1)):
         pages.append(page)
         page_new = 0
         page_skipped_year = 0
@@ -411,10 +411,10 @@ def collect_engagement_for_posts(client: LinkedInClient, urns: list[str], out_di
         print(f"  ({n}/{len(urns)}) {urn}")
         # comments
         comment_urns: list[str] = []
-        for i, page in enumerate(paginate_start(
+        for i, page in enumerate(paginate_cursor(
             client, "/rest/dmaFeedContentsExternal",
-            {"q": "commentsOnEntity", "entity": urn},
-            page_size=50, sleep_between=1,
+            {"q": "commentsOnEntity", "entity": urn, "maxPaginationCount": 100},
+            sleep_between=1,
         )):
             for el in page.get("elements", []):
                 for k in ("commentUrn", "urn"):
@@ -428,10 +428,10 @@ def collect_engagement_for_posts(client: LinkedInClient, urns: list[str], out_di
             write_json(post_dir / "comments.json", batch_get(client, "/rest/dmaComments", comment_urns))
         # reactions
         reaction_urns: list[str] = []
-        for i, page in enumerate(paginate_start(
+        for i, page in enumerate(paginate_cursor(
             client, "/rest/dmaFeedContentsExternal",
-            {"q": "reactionsOnEntity", "entity": urn},
-            page_size=50, sleep_between=1,
+            {"q": "reactionsOnEntity", "entity": urn, "maxPaginationCount": 100},
+            sleep_between=1,
         )):
             for el in page.get("elements", []):
                 for k in ("reactionUrn", "urn"):
