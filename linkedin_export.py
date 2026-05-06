@@ -12,6 +12,7 @@ Tokens are cached in ./.token.json and refreshed automatically.
 import argparse
 import json
 import os
+import os.path
 import secrets
 import sys
 import time
@@ -623,6 +624,77 @@ def _post_url(urn: str) -> str:
     return f"https://www.linkedin.com/feed/update/{urllib.parse.quote(urn, safe=':')}/"
 
 
+def _iter_media(post: dict):
+    """Yield (kind, alt_text, download_url) tuples for each media item in a post.
+
+    kind is one of: image, video, document, article-thumb.
+    """
+    content = (post or {}).get("content") or {}
+    if not isinstance(content, dict):
+        return
+
+    media = content.get("media")
+    if isinstance(media, dict):
+        alt = media.get("altText", "") or ""
+        inner = media.get("media")
+        if isinstance(inner, dict):
+            for kind in ("image", "video", "document"):
+                m = inner.get(kind)
+                if isinstance(m, dict):
+                    url = m.get("downloadUrl") or m.get("playbackUrl")
+                    if isinstance(url, str) and url.startswith("http"):
+                        yield (kind, alt, url)
+
+    multi = content.get("multiImage")
+    if isinstance(multi, dict):
+        for wrap in multi.get("images") or []:
+            if isinstance(wrap, dict):
+                m = wrap.get("image") or {}
+                url = m.get("downloadUrl") if isinstance(m, dict) else None
+                if isinstance(url, str) and url.startswith("http"):
+                    yield ("image", wrap.get("altText", "") or "", url)
+
+    article = content.get("article")
+    if isinstance(article, dict):
+        for k in ("thumbnail", "thumbnailUrl"):
+            t = article.get(k)
+            if isinstance(t, str) and t.startswith("http"):
+                yield ("article-thumb", article.get("title") or "", t)
+
+
+def _ext_for_url(url: str, kind: str) -> str:
+    path = urllib.parse.urlparse(url).path
+    if "." in path:
+        ext = path.rsplit(".", 1)[-1].lower()
+        if ext in {"jpg", "jpeg", "png", "gif", "webp", "mp4", "mov", "webm", "pdf"}:
+            return ext
+    if kind == "image":
+        return "jpg"
+    if kind == "video":
+        return "mp4"
+    if kind == "document":
+        return "pdf"
+    return "bin"
+
+
+def _download_media(url: str, dest: Path) -> bool:
+    if dest.exists() and dest.stat().st_size > 0:
+        return True
+    try:
+        r = requests.get(url, stream=True, timeout=120)
+    except Exception as e:
+        print(f"    media download failed ({e})")
+        return False
+    if not r.ok:
+        print(f"    media {dest.name}: HTTP {r.status_code}")
+        return False
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with open(dest, "wb") as f:
+        for chunk in r.iter_content(8192):
+            f.write(chunk)
+    return True
+
+
 def _actor_label(actor_urn: str | None, people: dict, orgs: dict) -> str:
     """Render a clickable label for a person or organization URN, with privacy fallbacks."""
     if not actor_urn:
@@ -858,6 +930,17 @@ def render_markdown(client: LinkedInClient, out_dir: Path, post_urns: list[str])
         analytics_totals = _impressions(bundle.get("analytics") or {})
         text = _post_text(post or {})
 
+        # Download media (images/videos/documents) and build relative paths for the markdown.
+        slug = urn.replace(":", "_")
+        images_dir = out_dir / "images" / slug
+        media_items = list(_iter_media(post or {}))
+        local_media: list[tuple[str, str, Path]] = []
+        for idx, (kind, alt, url) in enumerate(media_items):
+            ext = _ext_for_url(url, kind)
+            dest = images_dir / f"{idx:02d}_{kind}.{ext}"
+            if _download_media(url, dest):
+                local_media.append((kind, alt, dest))
+
         lines: list[str] = []
         first_line = (text.strip().splitlines() or [""])[0][:80].strip() or urn
         lines.append(f"# {first_line}")
@@ -877,6 +960,23 @@ def render_markdown(client: LinkedInClient, out_dir: Path, post_urns: list[str])
         lines.append("")
         lines.append(text.strip() if text else "_(no text body found in dmaPosts response — see posts.json)_")
         lines.append("")
+
+        if local_media:
+            lines.append(f"## Media ({len(local_media)})")
+            lines.append("")
+            md_path_parent = md_root / str(dt.year)
+            for kind, alt, path in local_media:
+                # Path of the markdown file relative to the image
+                try:
+                    rel = os.path.relpath(path, md_path_parent)
+                except ValueError:
+                    rel = str(path)
+                if kind == "image" or kind == "article-thumb":
+                    lines.append(f"![{alt}]({rel})")
+                else:
+                    label = alt or kind
+                    lines.append(f"- [{label} ({kind})]({rel})")
+                lines.append("")
 
         reactions = bundle.get("reactions") or {}
         lines.append(f"## Reactions ({len(reactions)})")
