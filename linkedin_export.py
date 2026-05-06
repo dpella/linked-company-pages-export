@@ -312,16 +312,31 @@ def urn_timestamp_ms(urn: str) -> int | None:
 
     LinkedIn IDs are Snowflake-like: the high bits encode a Unix epoch-ms.
     Empirically `int(numeric_part) >> 22` gives the creation timestamp in ms.
+
+    Handles both simple URNs (urn:li:share:123) and compound URNs like
+    urn:li:instantRepost:(urn:li:share:abc,123) or
+    urn:li:reaction:(urn:li:organization:abc,urn:li:activity:123) — the
+    most-recent numeric id is taken.
     """
-    try:
-        numeric = urn.rsplit(":", 1)[-1]
-        n = int(numeric)
+    if not isinstance(urn, str):
+        return None
+    candidates: list[int] = []
+    if "(" in urn:
+        # Compound URN — pull last segment from inside the parens
+        inside = urn.split("(", 1)[1].rsplit(")", 1)[0]
+        for piece in inside.split(","):
+            piece = piece.strip()
+            tail = piece.rsplit(":", 1)[-1] if ":" in piece else piece
+            if tail.isdigit():
+                candidates.append(int(tail))
+    else:
+        tail = urn.rsplit(":", 1)[-1]
+        if tail.isdigit():
+            candidates.append(int(tail))
+    for n in candidates:
         ts = n >> 22
-        # sanity: between 2008 and 2050
         if 1_200_000_000_000 < ts < 2_500_000_000_000:
             return ts
-    except (ValueError, AttributeError):
-        pass
     return None
 
 
@@ -341,78 +356,83 @@ def collect_post_urns(client: LinkedInClient, org_id: str, out_dir: Path,
         print(f"\n[posts:list] listing post URNs (postsByAuthor) — years {sorted(years)}")
     # Posts are authored by the organization entity, not the organizationalPage.
     org_urn = f"urn:li:organization:{org_id}"
-    params = {"q": "postsByAuthor", "author": org_urn, "maxPaginationCount": 100}
     pages = []
     urns: list[str] = []
-    urn_meta: list[dict] = []  # parallel: {urn, year?, ts_ms?}
+    urn_meta: list[dict] = []  # parallel: {urn, year?, ts_ms?, source}
     seen: set[str] = set()
     earliest_wanted = min(years) if years else None
     short_circuit = False
-    for i, page in enumerate(paginate_cursor(client, "/rest/dmaFeedContentsExternal", params, sleep_between=1)):
-        pages.append(page)
-        page_new = 0
-        page_skipped_year = 0
-        page_no_urn = 0
-        elements = page.get("elements", [])
-        if i == 0 and elements:
-            sample_keys = sorted(elements[0].keys()) if isinstance(elements[0], dict) else []
-            print(f"  [debug] first element keys: {sample_keys}")
-        for el in elements:
-            urn = None
-            for k in ("id", "ugcUrn", "instantRepostUrn", "shareUrn", "postUrn", "urn",
-                      "feedContentUrn", "objectUrn", "entityUrn", "contentUrn"):
-                v = el.get(k) if isinstance(el, dict) else None
-                if isinstance(v, str) and v.startswith("urn:"):
-                    urn = v
-                    break
-            if not urn:
-                # Last-ditch: any string value that looks like a URN
-                if isinstance(el, dict):
-                    for v in el.values():
-                        if isinstance(v, str) and v.startswith("urn:li:"):
+
+    finders: list[tuple[str, dict, str]] = [
+        ("postsByAuthor", {"q": "postsByAuthor", "author": org_urn, "maxPaginationCount": 100}, "post"),
+        ("repostsByReposter", {"q": "repostsByReposter", "reposter": org_urn, "maxPaginationCount": 100}, "repost"),
+    ]
+    for finder_name, params, kind in finders:
+        print(f"\n  finder: {finder_name}")
+        short_circuit = False
+        try:
+            iterator = enumerate(paginate_cursor(client, "/rest/dmaFeedContentsExternal", params, sleep_between=1))
+            for i, page in iterator:
+                pages.append({"finder": finder_name, "page": page})
+                page_new = 0
+                page_skipped_year = 0
+                page_no_urn = 0
+                elements = page.get("elements", [])
+                if i == 0 and elements:
+                    sample_keys = sorted(elements[0].keys()) if isinstance(elements[0], dict) else []
+                    print(f"  [debug] first element keys: {sample_keys}")
+                for el in elements:
+                    urn = None
+                    for k in ("id", "ugcUrn", "instantRepostUrn", "shareUrn", "postUrn", "urn",
+                              "feedContentUrn", "objectUrn", "entityUrn", "contentUrn"):
+                        v = el.get(k) if isinstance(el, dict) else None
+                        if isinstance(v, str) and v.startswith("urn:"):
                             urn = v
                             break
-            if not urn:
-                page_no_urn += 1
-                continue
-            if urn in seen:
-                continue
-            ts_ms = _extract_timestamp_ms(el) or urn_timestamp_ms(urn)
-            year = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).year if ts_ms else None
-            # year filter
-            if years is not None and year is not None and year not in years:
-                page_skipped_year += 1
-                # Short-circuit: results are creation-desc, so once we're below
-                # the earliest wanted year we can stop entirely.
-                if earliest_wanted is not None and year < earliest_wanted:
-                    short_circuit = True
-                continue
-            if years is not None and year is None:
-                # No timestamp on the listing element — keep it; we'll filter
-                # again after hydration if needed.
-                pass
-            seen.add(urn)
-            urns.append(urn)
-            urn_meta.append({"urn": urn, "year": year, "ts_ms": ts_ms})
-            page_new += 1
-            if ts_ms is not None:
-                date_label = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
-            else:
-                date_label = "????-??-??"
-            print(f"    {len(urns):>4}. [{date_label}] {urn}")
-        msg = f"  page {i + 1}: {len(elements)} elements, +{page_new} kept"
-        if page_skipped_year:
-            msg += f", {page_skipped_year} skipped (year)"
-        if page_no_urn:
-            msg += f", {page_no_urn} no-urn"
-        msg += f"  (total {len(urns)})"
-        print(msg)
-        if short_circuit:
-            print(f"  short-circuit: page contained items older than earliest wanted year ({earliest_wanted})")
-            break
-        if max_pages and i + 1 >= max_pages:
-            print(f"  stopping at --max-pages={max_pages}")
-            break
+                    if not urn:
+                        if isinstance(el, dict):
+                            for v in el.values():
+                                if isinstance(v, str) and v.startswith("urn:li:"):
+                                    urn = v
+                                    break
+                    if not urn:
+                        page_no_urn += 1
+                        continue
+                    if urn in seen:
+                        continue
+                    ts_ms = _extract_timestamp_ms(el) or urn_timestamp_ms(urn)
+                    year = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).year if ts_ms else None
+                    if years is not None and year is not None and year not in years:
+                        page_skipped_year += 1
+                        if earliest_wanted is not None and year < earliest_wanted:
+                            short_circuit = True
+                        continue
+                    seen.add(urn)
+                    urns.append(urn)
+                    urn_meta.append({"urn": urn, "year": year, "ts_ms": ts_ms, "source": kind, "finder": finder_name})
+                    page_new += 1
+                    if ts_ms is not None:
+                        date_label = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+                    else:
+                        date_label = "????-??-??"
+                    tag = "" if kind == "post" else f" ({kind})"
+                    print(f"    {len(urns):>4}. [{date_label}]{tag} {urn}")
+                msg = f"  page {i + 1}: {len(elements)} elements, +{page_new} kept"
+                if page_skipped_year:
+                    msg += f", {page_skipped_year} skipped (year)"
+                if page_no_urn:
+                    msg += f", {page_no_urn} no-urn"
+                msg += f"  (total {len(urns)})"
+                print(msg)
+                if short_circuit:
+                    print(f"  short-circuit: page contained items older than earliest wanted year ({earliest_wanted})")
+                    break
+                if max_pages and i + 1 >= max_pages:
+                    print(f"  stopping at --max-pages={max_pages}")
+                    break
+        except Exception as e:
+            print(f"  finder {finder_name} failed: {e}")
+            continue
     write_json(out_dir / "post_urns.json", urns)
     write_json(out_dir / "post_urns_meta.json", urn_meta)
     write_json(out_dir / "post_listing_raw_pages.json", pages)
@@ -869,7 +889,8 @@ def collect_orgs(client: LinkedInClient, urns: list[str]) -> dict:
     return rekeyed
 
 
-def render_markdown(client: LinkedInClient, out_dir: Path, post_urns: list[str]) -> None:
+def render_markdown(client: LinkedInClient, out_dir: Path, post_urns: list[str],
+                     repost_urns: list[str] | None = None) -> None:
     """Build per-post markdown files under posts_md/<year>/<date>_<short-id>.md."""
     posts_path = out_dir / "posts.json"
     if not posts_path.exists():
@@ -877,6 +898,22 @@ def render_markdown(client: LinkedInClient, out_dir: Path, post_urns: list[str])
         return
     posts_pages = json.loads(posts_path.read_text())
     posts = _flatten_batch_results(posts_pages)
+
+    # Hydrate instant reposts so we can render them with the same date/link structure.
+    reposts: dict = {}
+    repost_actor_orgs: set[str] = set()
+    if repost_urns:
+        try:
+            print(f"\n[render] hydrating {len(repost_urns)} instant repost(s) via /rest/dmaInstantReposts")
+            rp_pages = batch_get(client, "/rest/dmaInstantReposts", repost_urns)
+            write_json(out_dir / "instant_reposts.json", rp_pages)
+            reposts = _flatten_batch_results(rp_pages)
+            for r in reposts.values():
+                a = _actor_in(r)
+                if a and a.startswith("urn:li:organization:"):
+                    repost_actor_orgs.add(a)
+        except Exception as e:
+            print(f"  /rest/dmaInstantReposts BATCH_GET failed: {e}")
 
     # Collect actor URNs (people + orgs) from comments + reactions.
     per_post: dict[str, dict] = {}
@@ -909,7 +946,7 @@ def render_markdown(client: LinkedInClient, out_dir: Path, post_urns: list[str])
         }
 
     people = collect_people(client, sorted(person_urns))
-    orgs = collect_orgs(client, sorted(org_urns))
+    orgs = collect_orgs(client, sorted(org_urns | repost_actor_orgs))
     write_json(out_dir / "people.json", people)
     write_json(out_dir / "orgs.json", orgs)
 
@@ -1024,6 +1061,71 @@ def render_markdown(client: LinkedInClient, out_dir: Path, post_urns: list[str])
             rel = target
         print(f"  wrote {rel}")
 
+    # Render instant reposts as their own short markdown files.
+    for urn in (repost_urns or []):
+        repost = reposts.get(urn) or {}
+        # Extract the underlying share/ugcPost URN from the compound key:
+        # urn:li:instantRepost:(<original_urn>,<repost_id>)
+        original = ""
+        if "(" in urn:
+            inside = urn.split("(", 1)[1].rsplit(")", 1)[0]
+            original = inside.split(",", 1)[0].strip()
+        # Try to read createdAt from the repost object; fall back to URN-decoded ms
+        # of the repost id (second element of the compound).
+        ms = None
+        if isinstance(repost, dict):
+            for k in ("createdAt", "created"):
+                v = repost.get(k)
+                if isinstance(v, int) and v > 10**12:
+                    ms = v
+                    break
+                if isinstance(v, dict):
+                    t = v.get("time")
+                    if isinstance(t, int) and t > 10**12:
+                        ms = t
+                        break
+        if not ms and "(" in urn:
+            tail = urn.split(",", 1)[-1].rstrip(")")
+            try:
+                ms = int(tail) >> 22
+                if not (1_200_000_000_000 < ms < 2_500_000_000_000):
+                    ms = None
+            except ValueError:
+                ms = None
+        if not ms:
+            ms = urn_timestamp_ms(original) if original else None
+        if not ms:
+            print(f"  skip repost {urn}: no timestamp")
+            continue
+        dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+        date_s = dt.strftime("%Y-%m-%d")
+        short_id = urn.rstrip(")").rsplit(",", 1)[-1][-7:]
+        target = md_root / str(dt.year) / f"{date_s}_repost_{short_id}.md"
+        actor = _actor_in(repost) if isinstance(repost, dict) else None
+        original_link = _post_url(original) if original else "—"
+
+        lines: list[str] = [
+            f"# Repost — {date_s}",
+            "",
+            f"- **Date:** {date_s} ({_ts_to_str(ms)})",
+            f"- **Repost URN:** `{urn}`",
+            f"- **Original:** `{original}`",
+            f"- **Original link:** {original_link}",
+        ]
+        if actor:
+            lines.append(f"- **Reposter:** {_actor_label(actor, people, orgs)}")
+        lines += [
+            "",
+            "_(This is an instant repost — engagement and analytics live on the original post.)_",
+        ]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("\n".join(lines))
+        try:
+            rel = target.resolve().relative_to(ROOT)
+        except ValueError:
+            rel = target
+        print(f"  wrote {rel}")
+
 
 # ------------------------------- entrypoint --------------------------------
 
@@ -1096,8 +1198,18 @@ def main() -> None:
     client = LinkedInClient(token)
 
     post_urns: list[str] = []
+    repost_urns: list[str] = []
     if args.posts:
-        post_urns = collect_post_urns(client, args.org_id, out_dir, args.max_pages, years)
+        all_urns = collect_post_urns(client, args.org_id, out_dir, args.max_pages, years)
+        # Split off instantRepost URNs — they have a compound key shape that
+        # /rest/dmaPosts, comments/reactions endpoints, and per-post analytics
+        # all reject. They get their own pipeline (hydrated via dmaInstantReposts
+        # in the renderer) and are summarized separately.
+        post_urns = [u for u in all_urns if not u.startswith("urn:li:instantRepost:")]
+        repost_urns = [u for u in all_urns if u.startswith("urn:li:instantRepost:")]
+        if repost_urns:
+            print(f"  ({len(repost_urns)} instant repost(s) split off — hydrated via /rest/dmaInstantReposts at render time)")
+            write_json(out_dir / "repost_urns.json", repost_urns)
         if args.list_only:
             print(f"\n[list-only] stopping after listing. URNs in {out_dir / 'post_urns.json'}")
             return
@@ -1111,7 +1223,7 @@ def main() -> None:
         collect_followers(client, args.org_id, out_dir, args.max_pages)
 
     if args.render:
-        render_markdown(client, out_dir, post_urns)
+        render_markdown(client, out_dir, post_urns, repost_urns)
 
     print(f"\nDone. Output in {out_dir}")
 
