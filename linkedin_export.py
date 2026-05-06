@@ -204,7 +204,11 @@ def encode_urn_list(urns: list[str]) -> str:
 def write_json(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
-    print(f"  wrote {path.relative_to(ROOT)} ({path.stat().st_size:,} bytes)")
+    try:
+        rel = path.resolve().relative_to(ROOT)
+    except ValueError:
+        rel = path
+    print(f"  wrote {rel} ({path.stat().st_size:,} bytes)")
 
 
 # ----------------------------- pagination helpers --------------------------
@@ -302,6 +306,24 @@ def _extract_timestamp_ms(el: dict) -> int | None:
     return None
 
 
+def urn_timestamp_ms(urn: str) -> int | None:
+    """Decode the embedded epoch-ms from a LinkedIn share/ugcPost URN.
+
+    LinkedIn IDs are Snowflake-like: the high bits encode a Unix epoch-ms.
+    Empirically `int(numeric_part) >> 22` gives the creation timestamp in ms.
+    """
+    try:
+        numeric = urn.rsplit(":", 1)[-1]
+        n = int(numeric)
+        ts = n >> 22
+        # sanity: between 2008 and 2050
+        if 1_200_000_000_000 < ts < 2_500_000_000_000:
+            return ts
+    except (ValueError, AttributeError):
+        pass
+    return None
+
+
 def collect_post_urns(client: LinkedInClient, org_id: str, out_dir: Path,
                       max_pages: int | None, years: set[int] | None) -> list[str]:
     """List post URNs via /rest/dmaFeedContentsExternal?q=postsByAuthor.
@@ -316,8 +338,9 @@ def collect_post_urns(client: LinkedInClient, org_id: str, out_dir: Path,
         print("\n[posts:list] listing post URNs (postsByAuthor) — all years")
     else:
         print(f"\n[posts:list] listing post URNs (postsByAuthor) — years {sorted(years)}")
-    page_urn = f"urn:li:organizationalPage:{org_id}"
-    params = {"q": "postsByAuthor", "author": page_urn, "maxPaginationCount": 100}
+    # Posts are authored by the organization entity, not the organizationalPage.
+    org_urn = f"urn:li:organization:{org_id}"
+    params = {"q": "postsByAuthor", "author": org_urn, "maxPaginationCount": 100}
     pages = []
     urns: list[str] = []
     urn_meta: list[dict] = []  # parallel: {urn, year?, ts_ms?}
@@ -328,16 +351,32 @@ def collect_post_urns(client: LinkedInClient, org_id: str, out_dir: Path,
         pages.append(page)
         page_new = 0
         page_skipped_year = 0
-        for el in page.get("elements", []):
+        page_no_urn = 0
+        elements = page.get("elements", [])
+        if i == 0 and elements:
+            sample_keys = sorted(elements[0].keys()) if isinstance(elements[0], dict) else []
+            print(f"  [debug] first element keys: {sample_keys}")
+        for el in elements:
             urn = None
-            for k in ("ugcUrn", "instantRepostUrn", "shareUrn", "postUrn", "urn"):
-                v = el.get(k)
-                if isinstance(v, str):
+            for k in ("id", "ugcUrn", "instantRepostUrn", "shareUrn", "postUrn", "urn",
+                      "feedContentUrn", "objectUrn", "entityUrn", "contentUrn"):
+                v = el.get(k) if isinstance(el, dict) else None
+                if isinstance(v, str) and v.startswith("urn:"):
                     urn = v
                     break
-            if not urn or urn in seen:
+            if not urn:
+                # Last-ditch: any string value that looks like a URN
+                if isinstance(el, dict):
+                    for v in el.values():
+                        if isinstance(v, str) and v.startswith("urn:li:"):
+                            urn = v
+                            break
+            if not urn:
+                page_no_urn += 1
                 continue
-            ts_ms = _extract_timestamp_ms(el)
+            if urn in seen:
+                continue
+            ts_ms = _extract_timestamp_ms(el) or urn_timestamp_ms(urn)
             year = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).year if ts_ms else None
             # year filter
             if years is not None and year is not None and year not in years:
@@ -360,9 +399,11 @@ def collect_post_urns(client: LinkedInClient, org_id: str, out_dir: Path,
             else:
                 date_label = "????-??-??"
             print(f"    {len(urns):>4}. [{date_label}] {urn}")
-        msg = f"  page {i + 1}: +{page_new} kept"
+        msg = f"  page {i + 1}: {len(elements)} elements, +{page_new} kept"
         if page_skipped_year:
             msg += f", {page_skipped_year} skipped (year)"
+        if page_no_urn:
+            msg += f", {page_no_urn} no-urn"
         msg += f"  (total {len(urns)})"
         print(msg)
         if short_circuit:
