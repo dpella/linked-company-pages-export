@@ -268,26 +268,113 @@ def collect_followers(client: LinkedInClient, org_id: str, out_dir: Path, max_pa
     write_json(out_dir / "followers_raw_pages.json", pages)
 
 
-def collect_post_urns(client: LinkedInClient, org_id: str, out_dir: Path, max_pages: int | None) -> list[str]:
-    """List post URNs via /rest/dmaFeedContentsExternal?q=postsByAuthor."""
-    print("\n[posts] listing post URNs (postsByAuthor)")
+def parse_year_arg(s: str | None) -> set[int] | None:
+    """Parse a --year value: 'all' / '' / None -> no filter. '2024' -> {2024}.
+    '2023,2025' -> {2023,2025}. '2022-2024' -> {2022,2023,2024}."""
+    if not s or s.strip().lower() == "all":
+        return None
+    out: set[int] = set()
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            lo, hi = int(a), int(b)
+            if lo > hi:
+                lo, hi = hi, lo
+            out.update(range(lo, hi + 1))
+        else:
+            out.add(int(part))
+    return out or None
+
+
+def _extract_timestamp_ms(el: dict) -> int | None:
+    for k in ("createdAt", "firstPublishedAt", "publishedAt", "lastModifiedAt", "createdTime"):
+        v = el.get(k)
+        if isinstance(v, int) and v > 10**12:  # plausibly an epoch-ms
+            return v
+        if isinstance(v, dict):
+            for kk in ("time", "value", "timestamp"):
+                vv = v.get(kk)
+                if isinstance(vv, int) and vv > 10**12:
+                    return vv
+    return None
+
+
+def collect_post_urns(client: LinkedInClient, org_id: str, out_dir: Path,
+                      max_pages: int | None, years: set[int] | None) -> list[str]:
+    """List post URNs via /rest/dmaFeedContentsExternal?q=postsByAuthor.
+
+    Prints each URN as it's discovered so the full listing is visible
+    before hydration / engagement / analytics calls run. Optionally
+    filters by post creation year and short-circuits pagination once the
+    listing drops below the earliest requested year (results are sorted
+    by creation time descending per the API contract).
+    """
+    if years is None:
+        print("\n[posts:list] listing post URNs (postsByAuthor) — all years")
+    else:
+        print(f"\n[posts:list] listing post URNs (postsByAuthor) — years {sorted(years)}")
     page_urn = f"urn:li:organizationalPage:{org_id}"
     params = {"q": "postsByAuthor", "author": page_urn}
     pages = []
     urns: list[str] = []
+    urn_meta: list[dict] = []  # parallel: {urn, year?, ts_ms?}
+    seen: set[str] = set()
+    earliest_wanted = min(years) if years else None
+    short_circuit = False
     for i, page in enumerate(paginate_start(client, "/rest/dmaFeedContentsExternal", params, page_size=50, sleep_between=1)):
         pages.append(page)
+        page_new = 0
+        page_skipped_year = 0
         for el in page.get("elements", []):
+            urn = None
             for k in ("ugcUrn", "instantRepostUrn", "shareUrn", "postUrn", "urn"):
-                if k in el and isinstance(el[k], str):
-                    urns.append(el[k])
+                v = el.get(k)
+                if isinstance(v, str):
+                    urn = v
                     break
-        print(f"  page {i + 1}: total URNs {len(urns)}")
-        if max_pages and i + 1 >= max_pages:
+            if not urn or urn in seen:
+                continue
+            ts_ms = _extract_timestamp_ms(el)
+            year = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).year if ts_ms else None
+            # year filter
+            if years is not None and year is not None and year not in years:
+                page_skipped_year += 1
+                # Short-circuit: results are creation-desc, so once we're below
+                # the earliest wanted year we can stop entirely.
+                if earliest_wanted is not None and year < earliest_wanted:
+                    short_circuit = True
+                continue
+            if years is not None and year is None:
+                # No timestamp on the listing element — keep it; we'll filter
+                # again after hydration if needed.
+                pass
+            seen.add(urn)
+            urns.append(urn)
+            urn_meta.append({"urn": urn, "year": year, "ts_ms": ts_ms})
+            page_new += 1
+            if ts_ms is not None:
+                date_label = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+            else:
+                date_label = "????-??-??"
+            print(f"    {len(urns):>4}. [{date_label}] {urn}")
+        msg = f"  page {i + 1}: +{page_new} kept"
+        if page_skipped_year:
+            msg += f", {page_skipped_year} skipped (year)"
+        msg += f"  (total {len(urns)})"
+        print(msg)
+        if short_circuit:
+            print(f"  short-circuit: page contained items older than earliest wanted year ({earliest_wanted})")
             break
-    urns = list(dict.fromkeys(urns))  # dedupe, preserve order
+        if max_pages and i + 1 >= max_pages:
+            print(f"  stopping at --max-pages={max_pages}")
+            break
     write_json(out_dir / "post_urns.json", urns)
+    write_json(out_dir / "post_urns_meta.json", urn_meta)
     write_json(out_dir / "post_listing_raw_pages.json", pages)
+    print(f"[posts:list] done — {len(urns)} unique post URN(s)")
     return urns
 
 
@@ -305,9 +392,9 @@ def batch_get(client: LinkedInClient, path: str, ids: list[str], chunk: int = 50
 
 def collect_posts(client: LinkedInClient, urns: list[str], out_dir: Path) -> None:
     if not urns:
-        print("\n[posts] no URNs to hydrate")
+        print("\n[posts:fetch] no URNs to hydrate")
         return
-    print(f"\n[posts] hydrating {len(urns)} posts via /rest/dmaPosts BATCH_GET")
+    print(f"\n[posts:fetch] hydrating {len(urns)} posts via /rest/dmaPosts BATCH_GET")
     pages = batch_get(client, "/rest/dmaPosts", urns)
     write_json(out_dir / "posts.json", pages)
 
@@ -413,6 +500,8 @@ def main() -> None:
     p.add_argument("--reauth", action="store_true", help="Force a fresh OAuth flow (ignore cached token).")
 
     p.add_argument("--posts", action="store_true", help="Fetch posts (URNs + hydrated objects).")
+    p.add_argument("--list-only", action="store_true",
+                   help="Only list post URNs (write post_urns.json), then exit. Skips BATCH_GET, engagement, analytics, followers.")
     p.add_argument("--engagement", action="store_true",
                    help="Per post: comments, reactions, social metadata. Implies --posts.")
     p.add_argument("--analytics", action="store_true",
@@ -422,12 +511,14 @@ def main() -> None:
     p.add_argument("--all", action="store_true",
                    help="Shortcut for --posts --engagement --analytics --followers.")
 
+    p.add_argument("--year", default="all",
+                   help="Filter posts by creation year. Examples: '2025', '2024,2025', '2022-2024', 'all' (default).")
     p.add_argument("--max-pages", type=int, default=None,
                    help="Cap pages per listing (debug).")
     p.add_argument("--analytics-start-ms", type=int, default=None,
-                   help="Analytics window start (epoch ms). Default: now - 365 days.")
+                   help="Analytics window start (epoch ms). Default: derived from --year, else now - 365 days.")
     p.add_argument("--analytics-end-ms", type=int, default=None,
-                   help="Analytics window end (epoch ms). Default: now.")
+                   help="Analytics window end (epoch ms). Default: derived from --year, else now.")
     args = p.parse_args()
 
     token = get_access_token(force_reauth=args.reauth)
@@ -442,8 +533,17 @@ def main() -> None:
         args.posts = args.engagement = args.analytics = args.followers = True
     if args.engagement or args.analytics:
         args.posts = True
+    if args.list_only:
+        args.posts = True
     if not (args.posts or args.engagement or args.analytics or args.followers):
-        sys.exit("Nothing to do — pass --posts / --engagement / --analytics / --followers / --all.")
+        sys.exit("Nothing to do — pass --posts / --engagement / --analytics / --followers / --all / --list-only.")
+
+    years = parse_year_arg(args.year)
+    # Derive analytics window from --year if not explicitly given.
+    if years and args.analytics_start_ms is None:
+        args.analytics_start_ms = int(datetime(min(years), 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+    if years and args.analytics_end_ms is None:
+        args.analytics_end_ms = int(datetime(max(years) + 1, 1, 1, tzinfo=timezone.utc).timestamp() * 1000) - 1
 
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
     out_dir = Path(args.out) / f"org-{args.org_id}" / ts
@@ -454,7 +554,10 @@ def main() -> None:
 
     post_urns: list[str] = []
     if args.posts:
-        post_urns = collect_post_urns(client, args.org_id, out_dir, args.max_pages)
+        post_urns = collect_post_urns(client, args.org_id, out_dir, args.max_pages, years)
+        if args.list_only:
+            print(f"\n[list-only] stopping after listing. URNs in {out_dir / 'post_urns.json'}")
+            return
         collect_posts(client, post_urns, out_dir)
     if args.engagement:
         collect_engagement_for_posts(client, post_urns, out_dir, args.max_pages)
