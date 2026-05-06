@@ -450,40 +450,71 @@ def collect_engagement_for_posts(client: LinkedInClient, urns: list[str], out_di
         slug = urn.replace(":", "_")
         post_dir = per_post_dir / slug
         print(f"  ({n}/{len(urns)}) {urn}")
+
         # comments
         comment_urns: list[str] = []
+        comment_pages: list[dict] = []
         for i, page in enumerate(paginate_cursor(
             client, "/rest/dmaFeedContentsExternal",
             {"q": "commentsOnEntity", "entity": urn, "maxPaginationCount": 100},
             sleep_between=1,
         )):
+            comment_pages.append(page)
             for el in page.get("elements", []):
-                for k in ("commentUrn", "urn"):
-                    if k in el and isinstance(el[k], str):
-                        comment_urns.append(el[k])
+                if not isinstance(el, dict):
+                    continue
+                for k in ("id", "commentUrn", "urn"):
+                    v = el.get(k)
+                    if isinstance(v, str) and v.startswith("urn:"):
+                        comment_urns.append(v)
                         break
+                else:
+                    for v in el.values():
+                        if isinstance(v, str) and v.startswith("urn:li:"):
+                            comment_urns.append(v)
+                            break
             if max_pages_per_post and i + 1 >= max_pages_per_post:
                 break
+        write_json(post_dir / "comment_listing_raw_pages.json", comment_pages)
+        comment_urns = list(dict.fromkeys(comment_urns))
         if comment_urns:
-            comment_urns = list(dict.fromkeys(comment_urns))
+            write_json(post_dir / "comment_urns.json", comment_urns)
             write_json(post_dir / "comments.json", batch_get(client, "/rest/dmaComments", comment_urns))
+        else:
+            print(f"    no comment URNs (listing returned {sum(len(p.get('elements') or []) for p in comment_pages)} elements)")
+
         # reactions
         reaction_urns: list[str] = []
+        reaction_pages: list[dict] = []
         for i, page in enumerate(paginate_cursor(
             client, "/rest/dmaFeedContentsExternal",
             {"q": "reactionsOnEntity", "entity": urn, "maxPaginationCount": 100},
             sleep_between=1,
         )):
+            reaction_pages.append(page)
             for el in page.get("elements", []):
-                for k in ("reactionUrn", "urn"):
-                    if k in el and isinstance(el[k], str):
-                        reaction_urns.append(el[k])
+                if not isinstance(el, dict):
+                    continue
+                for k in ("id", "reactionUrn", "urn"):
+                    v = el.get(k)
+                    if isinstance(v, str) and v.startswith("urn:"):
+                        reaction_urns.append(v)
                         break
+                else:
+                    for v in el.values():
+                        if isinstance(v, str) and v.startswith("urn:li:"):
+                            reaction_urns.append(v)
+                            break
             if max_pages_per_post and i + 1 >= max_pages_per_post:
                 break
+        write_json(post_dir / "reaction_listing_raw_pages.json", reaction_pages)
+        reaction_urns = list(dict.fromkeys(reaction_urns))
         if reaction_urns:
-            reaction_urns = list(dict.fromkeys(reaction_urns))
+            write_json(post_dir / "reaction_urns.json", reaction_urns)
             write_json(post_dir / "reactions.json", batch_get(client, "/rest/dmaReactions", reaction_urns))
+        else:
+            print(f"    no reaction URNs (listing returned {sum(len(p.get('elements') or []) for p in reaction_pages)} elements)")
+
         # social metadata (counts)
         write_json(post_dir / "social_metadata.json",
                    batch_get(client, "/rest/dmaSocialMetadata", [urn]))
@@ -529,6 +560,371 @@ def collect_analytics(client: LinkedInClient, org_id: str, post_urns: list[str],
         time.sleep(0.5)
 
 
+# --------------------------------- render ---------------------------------
+
+def _localized(field) -> str:
+    """Try to extract a string from a LinkedIn-style localized field."""
+    if isinstance(field, str):
+        return field
+    if isinstance(field, dict):
+        # {"localized": {"en_US": "..."}} or direct mapping
+        loc = field.get("localized") if "localized" in field else field
+        if isinstance(loc, dict) and loc:
+            # Prefer en_US if available, else first.
+            return loc.get("en_US") or next(iter(loc.values()), "")
+    return ""
+
+
+def _post_text(post: dict) -> str:
+    if not isinstance(post, dict):
+        return ""
+    # Try common shapes for post body text.
+    for k in ("commentary", "text", "body", "content"):
+        v = post.get(k)
+        if isinstance(v, str) and v.strip():
+            return v
+    sc = post.get("specificContent")
+    if isinstance(sc, dict):
+        ugc = sc.get("com.linkedin.ugc.ShareContent") or {}
+        sc_text = (ugc.get("shareCommentary") or {}).get("text")
+        if isinstance(sc_text, str):
+            return sc_text
+    return ""
+
+
+def _post_created_ms(post: dict, urn: str) -> int | None:
+    if isinstance(post, dict):
+        for k in ("firstPublishedAt", "publishedAt", "createdAt", "lastModifiedAt"):
+            v = post.get(k)
+            if isinstance(v, int) and v > 10**12:
+                return v
+            if isinstance(v, dict):
+                t = v.get("time") or v.get("value") or v.get("timestamp")
+                if isinstance(t, int) and t > 10**12:
+                    return t
+    return urn_timestamp_ms(urn)
+
+
+def _flatten_batch_results(pages) -> dict:
+    """BATCH_GET pages -> single {urn: object} dict."""
+    out: dict[str, dict] = {}
+    if not isinstance(pages, list):
+        pages = [pages]
+    for p in pages:
+        if not isinstance(p, dict):
+            continue
+        results = p.get("results")
+        if isinstance(results, dict):
+            out.update(results)
+    return out
+
+
+def _post_url(urn: str) -> str:
+    return f"https://www.linkedin.com/feed/update/{urllib.parse.quote(urn, safe=':')}/"
+
+
+def _actor_label(actor_urn: str | None, people: dict, orgs: dict) -> str:
+    """Render a clickable label for a person or organization URN, with privacy fallbacks."""
+    if not actor_urn:
+        return "_(private)_"
+    if actor_urn.startswith("urn:li:person:"):
+        info = people.get(actor_urn) or {}
+        first = _localized(info.get("firstName")) or info.get("localizedFirstName") or ""
+        last = _localized(info.get("lastName")) or info.get("localizedLastName") or ""
+        name = f"{first} {last}".strip()
+        vanity = info.get("vanityName") or info.get("publicIdentifier")
+        public_url = info.get("publicProfileUrl")
+        if not public_url and vanity:
+            public_url = f"https://www.linkedin.com/in/{vanity}/"
+        if name and public_url:
+            return f"[{name}]({public_url})"
+        if name:
+            return f"{name} (`{actor_urn}`)"
+        return f"`{actor_urn}`"
+    if actor_urn.startswith("urn:li:organization:"):
+        info = orgs.get(actor_urn) or {}
+        name = (
+            _localized(info.get("localizedName"))
+            or _localized(info.get("name"))
+            or info.get("vanityName")
+            or ""
+        )
+        vanity = info.get("vanityName")
+        org_id = actor_urn.rsplit(":", 1)[-1]
+        url = f"https://www.linkedin.com/company/{vanity or org_id}/"
+        if name:
+            return f"[{name}]({url})"
+        return f"[{actor_urn}]({url})"
+    return f"`{actor_urn}`"
+
+
+def _comment_text(c: dict) -> str:
+    if not isinstance(c, dict):
+        return ""
+    msg = c.get("message")
+    if isinstance(msg, dict):
+        t = msg.get("text") or msg.get("attributedText", {}).get("text")
+        if isinstance(t, str):
+            return t
+    for k in ("commentary", "text", "content"):
+        v = c.get(k)
+        if isinstance(v, str):
+            return v
+    return ""
+
+
+def _actor_in(obj) -> str | None:
+    """Pull an actor URN from an object — direct field or nested in created/lastModified."""
+    if not isinstance(obj, dict):
+        return None
+    for k in ("actor", "reactor", "agent", "author", "creator", "from"):
+        v = obj.get(k)
+        if isinstance(v, str) and v.startswith("urn:li:"):
+            return v
+    for k in ("created", "lastModified"):
+        sub = obj.get(k)
+        if isinstance(sub, dict):
+            v = sub.get("actor")
+            if isinstance(v, str) and v.startswith("urn:li:"):
+                return v
+    return None
+
+
+def _comment_actor(c: dict) -> str | None:
+    return _actor_in(c)
+
+
+def _reaction_actor(r: dict, urn: str | None = None) -> str | None:
+    a = _actor_in(r)
+    if a:
+        return a
+    # Compound reaction URN: urn:li:reaction:(<actor_urn>,<entity_urn>)
+    if urn and "(" in urn:
+        inside = urn.split("(", 1)[1].rsplit(")", 1)[0]
+        first = inside.split(",", 1)[0].strip()
+        if first.startswith("urn:li:"):
+            return first
+    return None
+
+
+def _reaction_type(r: dict) -> str:
+    if not isinstance(r, dict):
+        return ""
+    return r.get("reactionType") or r.get("type") or ""
+
+
+def _ts_to_str(ms) -> str:
+    if not isinstance(ms, int) or ms < 10**12:
+        return ""
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _impressions(analytics: dict) -> dict[str, int | None]:
+    """Pull totals for IMPRESSIONS/REACTIONS/COMMENTS/REPOSTS from a trend response."""
+    out: dict[str, int | None] = {"IMPRESSIONS": None, "REACTIONS": None, "COMMENTS": None, "REPOSTS": None, "CLICKS": None}
+    if not isinstance(analytics, dict):
+        return out
+    for el in analytics.get("elements") or []:
+        t = el.get("type")
+        if t not in out:
+            continue
+        m = el.get("metric") or {}
+        v = (m.get("value") or {}).get("totalCount") or {}
+        n = v.get("long")
+        if n is None:
+            bd = v.get("bigDecimal")
+            try:
+                n = int(float(bd)) if bd is not None else None
+            except ValueError:
+                n = None
+        if n is not None:
+            out[t] = (out[t] or 0) + n
+    return out
+
+
+def collect_people(client: LinkedInClient, urns: list[str]) -> dict:
+    """BATCH_GET /rest/dmaPeople for the given person URNs."""
+    if not urns:
+        return {}
+    print(f"\n[render] resolving {len(urns)} person URN(s) via /rest/dmaPeople")
+    try:
+        pages = batch_get(client, "/rest/dmaPeople", urns)
+    except Exception as e:
+        print(f"  /rest/dmaPeople failed: {e}")
+        return {}
+    return _flatten_batch_results(pages)
+
+
+def collect_orgs(client: LinkedInClient, urns: list[str]) -> dict:
+    """BATCH_GET /rest/dmaOrganizationLookup for the given organization URNs.
+
+    The endpoint expects integer IDs in `ids=List(...)`, not full URNs;
+    we strip the URN prefix and re-key the response back to URN form.
+    """
+    if not urns:
+        return {}
+    ids = []
+    id_to_urn: dict[str, str] = {}
+    for u in urns:
+        n = u.rsplit(":", 1)[-1]
+        if n.isdigit():
+            ids.append(n)
+            id_to_urn[n] = u
+    if not ids:
+        return {}
+    print(f"[render] resolving {len(ids)} organization URN(s) via /rest/dmaOrganizationLookup")
+    out: list[dict] = []
+    chunk = 50
+    for i in range(0, len(ids), chunk):
+        batch = ids[i:i + chunk]
+        raw = "ids=" + "List(" + ",".join(urllib.parse.quote(x, safe="") for x in batch) + ")"
+        try:
+            page = client.get("/rest/dmaOrganizationLookup", raw_query=raw)
+        except Exception as e:
+            print(f"  /rest/dmaOrganizationLookup failed: {e}")
+            return {}
+        out.append(page)
+        time.sleep(0.5)
+    flat = _flatten_batch_results(out)
+    # Re-key from numeric ID (string) to full URN so _actor_label can find them.
+    rekeyed: dict[str, dict] = {}
+    for k, v in flat.items():
+        # Some BATCH_GETs key by string of int; ensure both forms work.
+        if k in id_to_urn:
+            rekeyed[id_to_urn[k]] = v
+        else:
+            rekeyed[k] = v
+    return rekeyed
+
+
+def render_markdown(client: LinkedInClient, out_dir: Path, post_urns: list[str]) -> None:
+    """Build per-post markdown files under posts_md/<year>/<date>_<short-id>.md."""
+    posts_path = out_dir / "posts.json"
+    if not posts_path.exists():
+        print("[render] posts.json missing; skipping render")
+        return
+    posts_pages = json.loads(posts_path.read_text())
+    posts = _flatten_batch_results(posts_pages)
+
+    # Collect actor URNs (people + orgs) from comments + reactions.
+    per_post: dict[str, dict] = {}
+    person_urns: set[str] = set()
+    org_urns: set[str] = set()
+    for urn in post_urns:
+        slug = urn.replace(":", "_")
+        d = out_dir / "per_post" / slug
+        comments_pages = json.loads((d / "comments.json").read_text()) if (d / "comments.json").exists() else []
+        reactions_pages = json.loads((d / "reactions.json").read_text()) if (d / "reactions.json").exists() else []
+        analytics = json.loads((d / "analytics.json").read_text()) if (d / "analytics.json").exists() else {}
+        comments = _flatten_batch_results(comments_pages) if comments_pages else {}
+        reactions = _flatten_batch_results(reactions_pages) if reactions_pages else {}
+        for c in comments.values():
+            a = _comment_actor(c)
+            if a and a.startswith("urn:li:person:"):
+                person_urns.add(a)
+            elif a and a.startswith("urn:li:organization:"):
+                org_urns.add(a)
+        for r_urn, r in reactions.items():
+            a = _reaction_actor(r, r_urn)
+            if a and a.startswith("urn:li:person:"):
+                person_urns.add(a)
+            elif a and a.startswith("urn:li:organization:"):
+                org_urns.add(a)
+        per_post[urn] = {
+            "comments": comments,
+            "reactions": reactions,
+            "analytics": analytics,
+        }
+
+    people = collect_people(client, sorted(person_urns))
+    orgs = collect_orgs(client, sorted(org_urns))
+    write_json(out_dir / "people.json", people)
+    write_json(out_dir / "orgs.json", orgs)
+
+    md_root = out_dir / "posts_md"
+    print(f"\n[render] writing {len(post_urns)} markdown post(s) under {md_root}")
+    for urn in post_urns:
+        post = posts.get(urn)
+        ms = _post_created_ms(post or {}, urn)
+        if not ms:
+            print(f"  skip {urn}: no timestamp")
+            continue
+        dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+        date_s = dt.strftime("%Y-%m-%d")
+        short_id = urn.rsplit(":", 1)[-1][-7:]
+        target = md_root / str(dt.year) / f"{date_s}_{short_id}.md"
+
+        bundle = per_post.get(urn) or {}
+        analytics_totals = _impressions(bundle.get("analytics") or {})
+        text = _post_text(post or {})
+
+        lines: list[str] = []
+        first_line = (text.strip().splitlines() or [""])[0][:80].strip() or urn
+        lines.append(f"# {first_line}")
+        lines.append("")
+        lines.append(f"- **Date:** {date_s} ({_ts_to_str(ms)})")
+        lines.append(f"- **URN:** `{urn}`")
+        lines.append(f"- **Link:** {_post_url(urn)}")
+        lines.append("")
+        lines.append("## Stats")
+        lines.append("")
+        for k in ("IMPRESSIONS", "REACTIONS", "COMMENTS", "REPOSTS", "CLICKS"):
+            v = analytics_totals.get(k)
+            lines.append(f"- {k.title()}: {v if v is not None else '—'}")
+        lines.append("")
+
+        lines.append("## Content")
+        lines.append("")
+        lines.append(text.strip() if text else "_(no text body found in dmaPosts response — see posts.json)_")
+        lines.append("")
+
+        reactions = bundle.get("reactions") or {}
+        lines.append(f"## Reactions ({len(reactions)})")
+        lines.append("")
+        if not reactions:
+            lines.append("_None._")
+        else:
+            for r_urn, r in reactions.items():
+                rtype = _reaction_type(r) or "REACT"
+                actor = _reaction_actor(r, r_urn)
+                lines.append(f"- **{rtype}** — {_actor_label(actor, people, orgs)}")
+        lines.append("")
+
+        comments = bundle.get("comments") or {}
+        lines.append(f"## Comments ({len(comments)})")
+        lines.append("")
+        if not comments:
+            lines.append("_None._")
+        else:
+            def _comment_ts(c):
+                if not isinstance(c, dict):
+                    return 0
+                v = c.get("createdAt")
+                if isinstance(v, int):
+                    return v
+                cv = c.get("created")
+                if isinstance(cv, dict) and isinstance(cv.get("time"), int):
+                    return cv["time"]
+                return 0
+            ordered = sorted(comments.items(), key=lambda kv: _comment_ts(kv[1]))
+            for c_urn, c in ordered:
+                actor = _comment_actor(c)
+                created_ms = _comment_ts(c)
+                ctext = _comment_text(c).strip()
+                lines.append(f"### {_actor_label(actor, people, orgs)} — {_ts_to_str(created_ms) or 'unknown date'}")
+                lines.append("")
+                lines.append(ctext if ctext else "_(content not shared — commenter has not opted in)_")
+                lines.append("")
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("\n".join(lines))
+        try:
+            rel = target.resolve().relative_to(ROOT)
+        except ValueError:
+            rel = target
+        print(f"  wrote {rel}")
+
+
 # ------------------------------- entrypoint --------------------------------
 
 def main() -> None:
@@ -551,6 +947,10 @@ def main() -> None:
                    help="Fetch follower edges. Note: 1 req / 60s rate limit.")
     p.add_argument("--all", action="store_true",
                    help="Shortcut for --posts --engagement --analytics --followers.")
+    p.add_argument("--render", action="store_true",
+                   help="After fetching, write per-post markdown files under posts_md/<year>/<YYYY-MM-DD>_<id>.md "
+                        "(content + reactions with profile links + threaded comments + impressions). "
+                        "Implies --posts --engagement --analytics.")
 
     p.add_argument("--year", default="all",
                    help="Filter posts by creation year. Examples: '2025', '2024,2025', '2022-2024', 'all' (default).")
@@ -572,12 +972,14 @@ def main() -> None:
 
     if args.all:
         args.posts = args.engagement = args.analytics = args.followers = True
+    if args.render:
+        args.posts = args.engagement = args.analytics = True
     if args.engagement or args.analytics:
         args.posts = True
     if args.list_only:
         args.posts = True
     if not (args.posts or args.engagement or args.analytics or args.followers):
-        sys.exit("Nothing to do — pass --posts / --engagement / --analytics / --followers / --all / --list-only.")
+        sys.exit("Nothing to do — pass --posts / --engagement / --analytics / --followers / --all / --list-only / --render.")
 
     years = parse_year_arg(args.year)
     # Derive analytics window from --year if not explicitly given.
@@ -607,6 +1009,9 @@ def main() -> None:
                           args.analytics_start_ms, args.analytics_end_ms)
     if args.followers:
         collect_followers(client, args.org_id, out_dir, args.max_pages)
+
+    if args.render:
+        render_markdown(client, out_dir, post_urns)
 
     print(f"\nDone. Output in {out_dir}")
 
