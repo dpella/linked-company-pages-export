@@ -119,3 +119,32 @@ OAuth scope requested: `r_dma_admin_pages_content`.
 - `401 EMPTY_ACCESS_TOKEN` → token expired; rerun, the script will refresh. Or `--reauth`.
 - `403 FORBIDDEN` → app not provisioned for `r_dma_admin_pages_content`, or you don't have an admin role on the page.
 - `429 TOO_MANY_REQUESTS` → script waits per `Retry-After`; for follows this is intrinsic.
+
+## Getting access to the Pages Data Portability API
+
+Access to this API is gated — you can't just register an app and call the endpoints. LinkedIn has to verify and approve you first. The flow:
+
+1. **Be a Page admin.** You must have an `ADMINISTRATOR`, `CONTENT_ADMINISTRATOR`, or `ANALYST` role on the LinkedIn Page whose data you want to export. If you don't, ask whoever does to add you (Page → *Admin tools* → *Manage admins*) — your personal LinkedIn account, not a separate "company" account, is what gets the role.
+
+2. **Create a developer app.** Go to <https://www.linkedin.com/developers/apps/new>, fill in the basics (name, link the LinkedIn Page, upload a logo, accept the API terms). The app is the OAuth client your script authenticates as.
+
+3. **Apply for the Pages Data Portability product.** Open your app → **Products** tab → find **Pages Data Portability API** → click **Request access**. This opens a form asking for:
+   - Business / legal name and address.
+   - Country of operation (the API exists to satisfy the EU Digital Markets Act, so EU-relevant business context helps).
+   - Use case description — what you intend to do with the data, what page(s) you'll export, why.
+   - Confirmation that you're a Page admin.
+   - Acceptance of the [LinkedIn DMA Portability API Terms](https://www.linkedin.com/legal/l/portability-api-terms).
+
+4. **Wait for review.** LinkedIn's documentation says the decision typically comes within **7 business days**. You'll get a notification (and an email) when it's approved or denied. Until it's approved, the **Products** tab still shows "Request access" and OAuth attempts with `scope=r_dma_admin_pages_content` will fail with `Invalid scope` / `403 FORBIDDEN`.
+
+5. **Configure OAuth.** Once approved, in your app → **Auth** tab:
+   - Note the **Client ID** and **Client Secret** (paste into `.env`).
+   - Add `http://localhost:8000/callback` (or whatever you set as `LINKEDIN_REDIRECT_URI`) under **Authorized redirect URLs**. The redirect URL string must match byte-for-byte.
+
+6. **Run the OAuth flow** (`python linkedin_export.py --auth-only`) and you're done. The script's three-legged OAuth handshake is in [`linkedin_export.py`](./linkedin_export.py) and is also documented in LinkedIn's [3-legged OAuth Flow](https://learn.microsoft.com/en-us/linkedin/shared/authentication/authorization-code-flow) docs.
+
+Useful LinkedIn-side references:
+
+- [Pages Data Portability API Overview](https://learn.microsoft.com/en-us/linkedin/dma/pages-data-portability/pages-data-portability-overview?view=li-dma-data-portability-2025-11) — official endpoint catalogue.
+- [LinkedIn Pages Data Portability API application review and developer support](https://www.linkedin.com/help/linkedin/answer/a6220307) — what the review checks for and how to follow up if it's slow.
+- [Page owners exporting your data](https://www.linkedin.com/help/linkedin/answer/a1640638) — the member-side privacy toggle that controls whether commenters / reactors are obfuscated in your export.
