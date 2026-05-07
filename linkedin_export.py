@@ -548,7 +548,18 @@ def collect_analytics(client: LinkedInClient, org_id: str, post_urns: list[str],
     print("\n[analytics] org-level trend")
     metric_types = "List(IMPRESSIONS,UNIQUE_IMPRESSIONS,CLICKS,COMMENTS,REACTIONS,REPOSTS,ENGAGEMENT_RATE,CTR)"
     if start_ms is None:
-        start_ms = int((datetime.now(timezone.utc).timestamp() - 365 * 24 * 3600) * 1000)
+        # Default to the earliest post timestamp present (decoded from URN), else
+        # 2010-01-01 — wide enough to cover the org's full history. Don't cap to
+        # 365 days; older posts then come back with empty analytics elements.
+        candidates: list[int] = []
+        for u in post_urns or []:
+            t = urn_timestamp_ms(u)
+            if t:
+                candidates.append(t)
+        if candidates:
+            start_ms = min(candidates) - 24 * 3600 * 1000  # 1 day of slack
+        else:
+            start_ms = int(datetime(2010, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
     if end_ms is None:
         end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     time_intervals = f"(timeRange:(start:{start_ms},end:{end_ms}),timeGranularityType:DAY)"
@@ -675,9 +686,11 @@ def _post_url(urn: str) -> str:
 
 
 def _iter_media(post: dict):
-    """Yield (kind, alt_text, download_url) tuples for each media item in a post.
+    """Yield (kind, alt_text, download_url) tuples for each downloadable media item.
 
-    kind is one of: image, video, document, article-thumb.
+    kind is one of: image, video, video-thumb, document, article-thumb.
+    Non-downloadable post artefacts (article cards, polls, event references)
+    are rendered separately by the caller via _render_post_extras().
     """
     content = (post or {}).get("content") or {}
     if not isinstance(content, dict):
@@ -688,19 +701,38 @@ def _iter_media(post: dict):
         alt = media.get("altText", "") or ""
         inner = media.get("media")
         if isinstance(inner, dict):
-            for kind in ("image", "video", "document"):
-                m = inner.get(kind)
-                if isinstance(m, dict):
-                    url = m.get("downloadUrl") or m.get("playbackUrl")
-                    if isinstance(url, str) and url.startswith("http"):
-                        yield (kind, alt, url)
+            img = inner.get("image")
+            if isinstance(img, dict):
+                url = img.get("downloadUrl")
+                if isinstance(url, str) and url.startswith("http"):
+                    yield ("image", alt, url)
+            vid = inner.get("video")
+            if isinstance(vid, dict):
+                vurl = vid.get("downloadUrl") or vid.get("playbackUrl")
+                if isinstance(vurl, str) and vurl.startswith("http"):
+                    yield ("video", alt, vurl)
+                # Save the highest-res thumbnail too so the markdown has a poster frame.
+                thumbs = vid.get("thumbnails") or []
+                if isinstance(thumbs, list):
+                    for t in thumbs:
+                        if isinstance(t, dict):
+                            turl = t.get("downloadUrl")
+                            if isinstance(turl, str) and turl.startswith("http"):
+                                yield ("video-thumb", alt, turl)
+                                break
+            doc = inner.get("document")
+            if isinstance(doc, dict):
+                durl = doc.get("downloadUrl")
+                if isinstance(durl, str) and durl.startswith("http"):
+                    yield ("document", alt, durl)
 
     multi = content.get("multiImage")
     if isinstance(multi, dict):
         for wrap in multi.get("images") or []:
             if isinstance(wrap, dict):
-                m = wrap.get("image") or {}
-                url = m.get("downloadUrl") if isinstance(m, dict) else None
+                inner = wrap.get("media") or {}
+                img = inner.get("image") if isinstance(inner, dict) else None
+                url = img.get("downloadUrl") if isinstance(img, dict) else None
                 if isinstance(url, str) and url.startswith("http"):
                     yield ("image", wrap.get("altText", "") or "", url)
 
@@ -712,13 +744,69 @@ def _iter_media(post: dict):
                 yield ("article-thumb", article.get("title") or "", t)
 
 
+def _render_post_extras(post: dict) -> list[str]:
+    """Return additional markdown lines for content types that aren't a downloadable file:
+    article cards, polls, and event/entity references."""
+    out: list[str] = []
+    content = (post or {}).get("content") or {}
+    if not isinstance(content, dict):
+        return out
+
+    article = content.get("article")
+    if isinstance(article, dict):
+        title = article.get("title") or article.get("source") or "Article"
+        source = article.get("source") or ""
+        desc = article.get("description") or ""
+        out.append("## Linked article")
+        out.append("")
+        if source:
+            out.append(f"**[{title}]({source})**")
+        else:
+            out.append(f"**{title}**")
+        if desc:
+            out.append("")
+            for line in desc.splitlines():
+                out.append(f"> {line}")
+        out.append("")
+
+    poll = content.get("poll")
+    if isinstance(poll, dict):
+        question = poll.get("question") or "Poll"
+        options = poll.get("options") or []
+        total = poll.get("uniqueVotersCount")
+        out.append(f"## Poll: {question}")
+        out.append("")
+        if isinstance(options, list):
+            for opt in options:
+                if isinstance(opt, dict):
+                    label = opt.get("text") or ""
+                    votes = opt.get("voteCount")
+                    suffix = f" — {votes} vote{'s' if votes != 1 else ''}" if isinstance(votes, int) else ""
+                    out.append(f"- {label}{suffix}")
+        if isinstance(total, int):
+            out.append("")
+            out.append(f"_Total voters: {total}_")
+        out.append("")
+
+    ref = content.get("reference")
+    if isinstance(ref, dict):
+        ref_id = ref.get("id") or ref.get("urn")
+        if isinstance(ref_id, str):
+            out.append("## Reference")
+            out.append("")
+            out.append(f"`{ref_id}`")
+            out.append("")
+
+    return out
+
+
 def _ext_for_url(url: str, kind: str) -> str:
     path = urllib.parse.urlparse(url).path
     if "." in path:
         ext = path.rsplit(".", 1)[-1].lower()
         if ext in {"jpg", "jpeg", "png", "gif", "webp", "mp4", "mov", "webm", "pdf"}:
             return ext
-    if kind == "image":
+    if kind in ("image", "article-thumb", "video-thumb"):
         return "jpg"
     if kind == "video":
         return "mp4"
@@ -1033,17 +1121,24 @@ def render_markdown(client: LinkedInClient, out_dir: Path, post_urns: list[str],
             lines.append("")
             md_path_parent = md_root / str(dt.year)
             for kind, alt, path in local_media:
-                # Path of the markdown file relative to the image
                 try:
                     rel = os.path.relpath(path, md_path_parent)
                 except ValueError:
                     rel = str(path)
-                if kind == "image" or kind == "article-thumb":
+                if kind in ("image", "article-thumb", "video-thumb"):
                     lines.append(f"![{alt}]({rel})")
+                elif kind == "video":
+                    label = alt or "video"
+                    lines.append(f"[▶ Watch {label} (mp4)]({rel})")
+                elif kind == "document":
+                    label = alt or "document"
+                    lines.append(f"[📄 {label} (download)]({rel})")
                 else:
                     label = alt or kind
                     lines.append(f"- [{label} ({kind})]({rel})")
                 lines.append("")
+
+        lines.extend(_render_post_extras(post or {}))
 
         reactions = bundle.get("reactions") or {}
         lines.append(f"## Reactions ({len(reactions)})")
@@ -1189,7 +1284,8 @@ def main() -> None:
     p.add_argument("--max-pages", type=int, default=None,
                    help="Cap pages per listing (debug).")
     p.add_argument("--analytics-start-ms", type=int, default=None,
-                   help="Analytics window start (epoch ms). Default: derived from --year, else now - 365 days.")
+                   help="Analytics window start (epoch ms). Default: derived from --year, "
+                        "else the earliest post date in the listing (so older posts get analytics too).")
     p.add_argument("--analytics-end-ms", type=int, default=None,
                    help="Analytics window end (epoch ms). Default: derived from --year, else now.")
     args = p.parse_args()
