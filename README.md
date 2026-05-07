@@ -114,6 +114,18 @@ OAuth scope requested: `r_dma_admin_pages_content`.
 - **Followers rate limit**: 1 request per 60 seconds. The script sleeps automatically; budget time for many followers.
 - **Analytics quotas**: hitting the privacy budget returns 0 values with a quota refresh time in metadata.
 
+## Notes on analytics
+
+The script calls `/rest/dmaOrganizationalPageContentAnalytics?q=trend` for both an org-level summary (`analytics_org_trend.json`) and per-post (`per_post/<slug>/analytics.json`). A few quirks of that endpoint to know about:
+
+- **14-month max window per call.** The API rejects any `timeIntervals` whose start–end span is more than 14 months (`400 BAD_REQUEST: "Start time and end time must be less than 14 months apart."`). The script chunks the requested range into ≤12-month windows and merges the `elements` from each call into a single response, so you can ask for the org's full multi-year history with `--all` and the chunking is transparent.
+- **Per-post windows are scoped to the post.** Each post's trend is fetched in a single call with the window `[post_date − 1 day, post_date + 12 months]`. Most engagement on a LinkedIn post happens within weeks of publication, so this captures everything without chunking.
+- **No upper-bound override needed for old posts.** When you run without `--year`, the org-level window auto-sets to `[earliest post date − 1 day, now]`. Override with `--analytics-start-ms` / `--analytics-end-ms` if you need a different window.
+- **Some old windows return 500.** When the page had no activity in a particular window (typical for spans before the page's first post), LinkedIn sometimes returns a persistent `HTTP 500` instead of an empty `elements` list. The script catches each such window, prints `skipping window YYYY-MM-DD..YYYY-MM-DD: ...`, records it under `metadata.failedWindows` in the merged JSON, and continues with the next window. The other windows still produce valid data — only the empty-data window is missing from the merged result.
+- **Empty `elements` ≠ broken.** A window that returns `200 OK` with an empty `elements` array genuinely had no activity. Don't confuse this with the 500 case above.
+- **Older posts may show no per-post stats.** The endpoint applies privacy thresholds: very small impression / reaction / comment counts are rounded to 0 (you can tell because `metadata` carries the quota-refresh marker). Posts older than ~12 months also occasionally return zero per-post elements regardless of what the trend was at the time.
+- **What the rendered markdown shows.** The `## Stats` block in each post's markdown sums totals across the trend window for `IMPRESSIONS`, `REACTIONS`, `COMMENTS`, `REPOSTS`, and `CLICKS`. If a metric is missing it renders as `—`.
+
 ## Troubleshooting
 
 - `401 EMPTY_ACCESS_TOKEN` → token expired; rerun, the script will refresh. Or `--reauth`.
