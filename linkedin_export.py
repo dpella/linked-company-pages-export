@@ -191,8 +191,12 @@ class LinkedInClient:
         for attempt in range(len(backoffs) + 1):
             r = self.s.get(url, params=params, timeout=60)
             if r.status_code == 429:
-                wait = int(r.headers.get("Retry-After", "60"))
-                print(f"  rate limited; sleeping {wait}s")
+                retry_after = r.headers.get("Retry-After")
+                wait = int(retry_after) if retry_after else 60
+                print(
+                    f"  rate limited; sleeping {wait}s "
+                    f"(Retry-After={retry_after!r}, body={r.text[:300]!r})"
+                )
                 time.sleep(wait)
                 continue
             if 500 <= r.status_code < 600:
