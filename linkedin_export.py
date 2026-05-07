@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import os.path
+import re
 import secrets
 import sys
 import time
@@ -596,6 +597,35 @@ def _localized(field) -> str:
     return ""
 
 
+_RX_HASHTAG = re.compile(r"\{hashtag\|\\?#\|([^}]+)\}")
+_RX_MENTION_ORG = re.compile(r"@\[([^\]]+)\]\(urn:li:organization:(\d+)\)")
+_RX_MENTION_PERSON = re.compile(r"@\[([^\]]+)\]\(urn:li:person:[^)]+\)")
+_RX_BACKSLASH_PUNCT = re.compile(r"\\([()|\[\]])")
+
+
+def _clean_post_text(text: str) -> str:
+    """Translate LinkedIn's inline markup into readable markdown.
+
+    - {hashtag|\\#|NAME}  -> [#NAME](https://www.linkedin.com/feed/hashtag/?keywords=NAME)
+    - @[Name](urn:li:organization:123) -> [Name](https://www.linkedin.com/company/123/)
+    - @[Name](urn:li:person:xxx) -> **Name**  (person URN can't be turned into a public URL)
+    - Unescape \\( \\) \\| \\[ \\] back to literal punctuation.
+    """
+    if not text:
+        return text
+    text = _RX_HASHTAG.sub(
+        lambda m: f"[#{m.group(1)}](https://www.linkedin.com/feed/hashtag/?keywords={urllib.parse.quote(m.group(1))})",
+        text,
+    )
+    text = _RX_MENTION_ORG.sub(
+        lambda m: f"[{m.group(1)}](https://www.linkedin.com/company/{m.group(2)}/)",
+        text,
+    )
+    text = _RX_MENTION_PERSON.sub(lambda m: f"**{m.group(1)}**", text)
+    text = _RX_BACKSLASH_PUNCT.sub(r"\1", text)
+    return text
+
+
 def _post_text(post: dict) -> str:
     if not isinstance(post, dict):
         return ""
@@ -965,7 +995,7 @@ def render_markdown(client: LinkedInClient, out_dir: Path, post_urns: list[str],
 
         bundle = per_post.get(urn) or {}
         analytics_totals = _impressions(bundle.get("analytics") or {})
-        text = _post_text(post or {})
+        text = _clean_post_text(_post_text(post or {}))
 
         # Download media (images/videos/documents) and build relative paths for the markdown.
         slug = urn.replace(":", "_")
@@ -1047,7 +1077,7 @@ def render_markdown(client: LinkedInClient, out_dir: Path, post_urns: list[str],
             for c_urn, c in ordered:
                 actor = _comment_actor(c)
                 created_ms = _comment_ts(c)
-                ctext = _comment_text(c).strip()
+                ctext = _clean_post_text(_comment_text(c).strip())
                 lines.append(f"### {_actor_label(actor, people, orgs)} — {_ts_to_str(created_ms) or 'unknown date'}")
                 lines.append("")
                 lines.append(ctext if ctext else "_(content not shared — commenter has not opted in)_")
