@@ -542,15 +542,49 @@ def collect_engagement_for_posts(client: LinkedInClient, urns: list[str], out_di
                    batch_get(client, "/rest/dmaSocialMetadata", [urn]))
 
 
+_ANALYTICS_MAX_MS = int(360 * 24 * 3600 * 1000)  # ~12 months; well under the 14-month API cap
+
+
+def _analytics_windows(start_ms: int, end_ms: int) -> list[tuple[int, int]]:
+    """Split [start, end] into <=12-month chunks (the trend endpoint refuses >14 months)."""
+    if end_ms <= start_ms:
+        return [(start_ms, end_ms)]
+    windows = []
+    cur = start_ms
+    while cur < end_ms:
+        nxt = min(cur + _ANALYTICS_MAX_MS, end_ms)
+        windows.append((cur, nxt))
+        cur = nxt
+    return windows
+
+
+def _fetch_trend_chunked(client: LinkedInClient, source_entity: str, metric_types: str,
+                         start_ms: int, end_ms: int) -> dict:
+    """Run /dmaOrganizationalPageContentAnalytics?q=trend in <=12-month windows
+    and merge their `elements` into a single response."""
+    merged: dict = {"elements": [], "metadata": {}, "paging": {"start": 0, "count": 0, "links": []}}
+    for w_start, w_end in _analytics_windows(start_ms, end_ms):
+        time_intervals = f"(timeRange:(start:{w_start},end:{w_end}),timeGranularityType:DAY)"
+        raw = (
+            f"q=trend"
+            f"&sourceEntity={urllib.parse.quote(source_entity, safe='')}"
+            f"&metricTypes={metric_types}"
+            f"&timeIntervals={time_intervals}"
+        )
+        page = client.get("/rest/dmaOrganizationalPageContentAnalytics", raw_query=raw)
+        elements = page.get("elements") or []
+        merged["elements"].extend(elements)
+        merged["paging"]["count"] = len(merged["elements"])
+    return merged
+
+
 def collect_analytics(client: LinkedInClient, org_id: str, post_urns: list[str], out_dir: Path,
                        start_ms: int | None, end_ms: int | None) -> None:
     """Org-level trend + per-post trend via /rest/dmaOrganizationalPageContentAnalytics."""
-    print("\n[analytics] org-level trend")
     metric_types = "List(IMPRESSIONS,UNIQUE_IMPRESSIONS,CLICKS,COMMENTS,REACTIONS,REPOSTS,ENGAGEMENT_RATE,CTR)"
     if start_ms is None:
         # Default to the earliest post timestamp present (decoded from URN), else
-        # 2010-01-01 — wide enough to cover the org's full history. Don't cap to
-        # 365 days; older posts then come back with empty analytics elements.
+        # 2010-01-01 — wide enough to cover the org's full history.
         candidates: list[int] = []
         for u in post_urns or []:
             t = urn_timestamp_ms(u)
@@ -562,15 +596,11 @@ def collect_analytics(client: LinkedInClient, org_id: str, post_urns: list[str],
             start_ms = int(datetime(2010, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
     if end_ms is None:
         end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    time_intervals = f"(timeRange:(start:{start_ms},end:{end_ms}),timeGranularityType:DAY)"
+
+    n_windows = len(_analytics_windows(start_ms, end_ms))
+    print(f"\n[analytics] org-level trend ({n_windows} windows of <=12 months)")
     org_urn = f"urn:li:organizationalPage:{org_id}"
-    raw = (
-        f"q=trend"
-        f"&sourceEntity={urllib.parse.quote(org_urn, safe='')}"
-        f"&metricTypes={metric_types}"
-        f"&timeIntervals={time_intervals}"
-    )
-    org_trend = client.get("/rest/dmaOrganizationalPageContentAnalytics", raw_query=raw)
+    org_trend = _fetch_trend_chunked(client, org_urn, metric_types, start_ms, end_ms)
     write_json(out_dir / "analytics_org_trend.json", org_trend)
 
     if not post_urns:
@@ -579,14 +609,13 @@ def collect_analytics(client: LinkedInClient, org_id: str, post_urns: list[str],
     per_post_dir = out_dir / "per_post"
     for n, urn in enumerate(post_urns, 1):
         slug = urn.replace(":", "_")
-        raw = (
-            f"q=trend"
-            f"&sourceEntity={urllib.parse.quote(urn, safe='')}"
-            f"&metricTypes={metric_types}"
-            f"&timeIntervals={time_intervals}"
-        )
+        # For per-post analytics, narrow the window to [post_date - 1d, post_date + 12 months]
+        # — most engagement lands in that span and it always fits in a single API call.
+        post_ms = urn_timestamp_ms(urn) or start_ms
+        post_start = max(start_ms, post_ms - 24 * 3600 * 1000)
+        post_end = min(end_ms, post_ms + _ANALYTICS_MAX_MS)
         try:
-            data = client.get("/rest/dmaOrganizationalPageContentAnalytics", raw_query=raw)
+            data = _fetch_trend_chunked(client, urn, metric_types, post_start, post_end)
             write_json(per_post_dir / slug / "analytics.json", data)
         except Exception as e:
             print(f"  ({n}/{len(post_urns)}) {urn}: error {e}")
