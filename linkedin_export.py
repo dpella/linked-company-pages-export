@@ -175,12 +175,20 @@ class LinkedInClient:
         })
 
     def get(self, path: str, params: dict | None = None, raw_query: str | None = None) -> dict:
-        """GET a JSON endpoint. `raw_query` overrides params (used for rest.li 2.0 List(...) syntax)."""
+        """GET a JSON endpoint. `raw_query` overrides params (used for rest.li 2.0 List(...) syntax).
+
+        On 5xx: retry once after 1s, once after 2s, then give up. The endpoints
+        we hit (especially analytics over old date ranges) routinely return
+        persistent 500s for legitimate "no data" cases, so longer backoffs just
+        delay the inevitable failure without any more chance of success.
+        On 429: honor the Retry-After header.
+        """
         url = f"{API_BASE}{path}"
         if raw_query is not None:
             url = f"{url}?{raw_query}"
             params = None
-        for attempt in range(5):
+        backoffs = [1, 2]  # seconds after attempts 0 and 1; attempt 2 is the last try
+        for attempt in range(len(backoffs) + 1):
             r = self.s.get(url, params=params, timeout=60)
             if r.status_code == 429:
                 wait = int(r.headers.get("Retry-After", "60"))
@@ -188,10 +196,14 @@ class LinkedInClient:
                 time.sleep(wait)
                 continue
             if 500 <= r.status_code < 600:
-                wait = 2 ** attempt
-                print(f"  {r.status_code}; retrying in {wait}s")
-                time.sleep(wait)
-                continue
+                if attempt < len(backoffs):
+                    wait = backoffs[attempt]
+                    print(f"  {r.status_code}; retrying in {wait}s")
+                    time.sleep(wait)
+                    continue
+                # Out of retries — surface the 5xx instead of the generic
+                # "too many retries" so callers can include it in their logs.
+                raise RuntimeError(f"GET {url} -> {r.status_code}: {r.text[:500]}")
             if not r.ok:
                 raise RuntimeError(f"GET {url} -> {r.status_code}: {r.text[:500]}")
             return r.json()
