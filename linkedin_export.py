@@ -561,9 +561,16 @@ def _analytics_windows(start_ms: int, end_ms: int) -> list[tuple[int, int]]:
 def _fetch_trend_chunked(client: LinkedInClient, source_entity: str, metric_types: str,
                          start_ms: int, end_ms: int) -> dict:
     """Run /dmaOrganizationalPageContentAnalytics?q=trend in <=12-month windows
-    and merge their `elements` into a single response."""
+    and merge their `elements` into a single response.
+
+    A window that fails persistently (e.g. an old span where the page had no
+    activity, which the endpoint sometimes returns 500 for instead of an empty
+    list) is skipped — the remaining windows still produce data.
+    """
     merged: dict = {"elements": [], "metadata": {}, "paging": {"start": 0, "count": 0, "links": []}}
-    for w_start, w_end in _analytics_windows(start_ms, end_ms):
+    failed: list[dict] = []
+    windows = _analytics_windows(start_ms, end_ms)
+    for w_start, w_end in windows:
         time_intervals = f"(timeRange:(start:{w_start},end:{w_end}),timeGranularityType:DAY)"
         raw = (
             f"q=trend"
@@ -571,10 +578,19 @@ def _fetch_trend_chunked(client: LinkedInClient, source_entity: str, metric_type
             f"&metricTypes={metric_types}"
             f"&timeIntervals={time_intervals}"
         )
-        page = client.get("/rest/dmaOrganizationalPageContentAnalytics", raw_query=raw)
+        try:
+            page = client.get("/rest/dmaOrganizationalPageContentAnalytics", raw_query=raw)
+        except Exception as e:
+            label_s = datetime.fromtimestamp(w_start / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+            label_e = datetime.fromtimestamp(w_end / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+            print(f"    skipping window {label_s}..{label_e}: {str(e)[:200]}")
+            failed.append({"start_ms": w_start, "end_ms": w_end, "error": str(e)[:500]})
+            continue
         elements = page.get("elements") or []
         merged["elements"].extend(elements)
         merged["paging"]["count"] = len(merged["elements"])
+    if failed:
+        merged["metadata"]["failedWindows"] = failed
     return merged
 
 
