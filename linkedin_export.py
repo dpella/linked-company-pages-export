@@ -673,6 +673,7 @@ _RX_HASHTAG = re.compile(r"\{hashtag\|\\?#\|([^}]+)\}")
 _RX_MENTION_ORG = re.compile(r"@\[([^\]]+)\]\(urn:li:organization:(\d+)\)")
 _RX_MENTION_PERSON = re.compile(r"@\[([^\]]+)\]\(urn:li:person:[^)]+\)")
 _RX_BACKSLASH_PUNCT = re.compile(r"\\([()|\[\]])")
+_RX_MD_LINK = re.compile(r"\[([^\]]+)\]\([^)]+\)")
 
 
 def _clean_post_text(text: str) -> str:
@@ -1158,7 +1159,8 @@ def render_markdown(client: LinkedInClient, out_dir: Path, post_urns: list[str],
                 local_media.append((kind, alt, dest))
 
         lines: list[str] = []
-        first_line = (text.strip().splitlines() or [""])[0][:80].strip() or urn
+        title_src = _RX_MD_LINK.sub(r"\1", (text.strip().splitlines() or [""])[0])
+        first_line = title_src[:80].strip() or urn
         lines.append(f"# {first_line}")
         lines.append("")
         lines.append(f"- **Date:** {date_s} ({_ts_to_str(ms)})")
